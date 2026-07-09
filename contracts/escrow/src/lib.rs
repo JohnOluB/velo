@@ -181,15 +181,9 @@ impl Htlc for EscrowContract {
     }
 }
 
-fn panic_with_error(env: &Env, err: Error) -> ! {
-    panic!("{}", err as u32);
-    #[allow(unreachable_code)]
-    {
-        let _ = env;
-        unreachable!()
-    }
+fn panic_with_error(_env: &Env, err: Error) -> ! {
+    panic!("{}", err as u32)
 }
-
 fn symbol_short(env: &Env, s: &str) -> soroban_sdk::Symbol {
     soroban_sdk::Symbol::new(env, s)
 }
