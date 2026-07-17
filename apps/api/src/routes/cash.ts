@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { CONTRACTS } from "@velo/shared";
-import { lockEscrow, releaseEscrow } from "../lib/stellar.js";
+import { lockEscrow, releaseEscrow, refundEscrow } from "../lib/stellar.js";
+import { sendRefundAlert } from "../lib/webhook.js";
 import { randomHex32 } from "../lib/crypto.js";
 import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders } from "../lib/store.js";
 
@@ -267,6 +268,48 @@ export async function cashRoutes(app: FastifyInstance) {
 
       updateStatus(record.id, "released");
       return { id: record.id, status: "released" };
+    }
+  );
+
+  app.post<{ Params: { id: string } }>(
+    "/cash/request/:id/refund",
+    {
+      config: {
+        rateLimit: { max: 10, timeWindow: "1 minute" },
+      },
+    },
+    async (req, reply) => {
+      const record = getCashRequest(req.params.id);
+      if (!record) {
+        reply.code(404).send({ error: "request not found" });
+        return;
+      }
+      if (record.status !== "locked") {
+        reply.code(409).send({ error: `request is already ${record.status}` });
+        return;
+      }
+
+      try {
+        await refundEscrow({
+          contractId: record.contractId,
+          tradeId: record.id,
+        });
+      } catch (err) {
+        req.log.error(err, "refundEscrow failed");
+        reply.code(502).send({ error: "escrow refund failed", detail: String(err) });
+        return;
+      }
+
+      updateStatus(record.id, "refunded");
+
+      sendRefundAlert({
+        tradeId: record.id,
+        amountStroops: record.amountStroops,
+        buyer: record.buyer,
+        seller: record.seller,
+      });
+
+      return { id: record.id, status: "refunded" };
     }
   );
 }
