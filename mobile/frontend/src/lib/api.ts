@@ -31,6 +31,30 @@ export async function releaseCashRequest(id: string, secret: string): Promise<vo
   }
 }
 
+export interface StatusResponse {
+  api: { status: string; uptime_seconds: number; timestamp: string };
+  chain: {
+    network: string;
+    status: string;
+    latest_ledger: number | null;
+    oldest_ledger: number | null;
+  };
+  recent_activity: Array<{
+    id: string;
+    status: "locked" | "released" | "refunded";
+    createdAt: string;
+  }>;
+}
+
+/** Public transparency data: API/chain health + recent (sanitized) activity. */
+export async function fetchStatus(): Promise<StatusResponse> {
+  const res = await fetch(`${API_BASE}/api/v1/status`);
+  if (!res.ok) {
+    throw new Error(`status request failed (${res.status})`);
+  }
+  return res.json();
+}
+
 /** Formats a stroop amount (7 decimal places) as a human-readable string. */
 export function formatStroops(stroops: string): string {
   const n = BigInt(stroops);
