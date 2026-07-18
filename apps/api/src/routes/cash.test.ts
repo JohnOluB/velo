@@ -8,12 +8,10 @@ import { sendRefundAlert } from "../lib/webhook.js";
 // Mock the Stellar functions to avoid real ledger/simulation calls
 vi.mock("../lib/stellar.js", () => ({
   lockEscrow: vi.fn().mockResolvedValue(undefined),
-  releaseEscrow: vi.fn(),
-  refundEscrow: vi.fn(),
-  disputeEscrow: vi.fn().mockResolvedValue(undefined),
-  resolveEscrow: vi.fn().mockResolvedValue(undefined),
   releaseEscrow: vi.fn().mockResolvedValue(undefined),
   refundEscrow: vi.fn().mockResolvedValue(undefined),
+  disputeEscrow: vi.fn().mockResolvedValue(undefined),
+  resolveEscrow: vi.fn().mockResolvedValue(undefined),
   CONTRACTS: { testnet: { escrow: "dummy_contract" } },
 }));
 
@@ -42,6 +40,7 @@ describe("cashRoutes", () => {
       return true;
     });
 
+<<<<<<< HEAD
     app.register(cashRoutes, { prefix: "/api/v1" });
   };
 
@@ -328,3 +327,6 @@ describe("cashRoutes", () => {
     await app.close();
   });
 });
+=======
+ /�E�"�׫���zƩ�����^�Ƭ�.��)���������m���r
+>>>>>>> aa7e78f (Fix CI build errors and format rules)
