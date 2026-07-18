@@ -253,7 +253,7 @@ describe("cashRoutes", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({
-      error: "invalid_request",
+      error: "mode must be either 'custodial' or 'non_custodial'",
     });
 
     await app.close();
