@@ -6,6 +6,7 @@ import Home from "./pages/Home.js";
 import ClaimQR from "./pages/ClaimQR.js";
 import RegisterProvider from "./pages/RegisterProvider.js";
 import Dashboard from "./pages/Dashboard.js";
+import Chat from "./pages/Chat.js";
 import { ErrorBoundary } from "./components/ErrorBoundary.js";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
@@ -21,6 +22,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
               no login, since agents (Claude, Telegram, WhatsApp) paste it
               directly into chat. */}
           <Route path="/claim/:id" element={<ClaimQR />} />
+          <Route path="/chat/:tradeId" element={<Chat />} />
         </Routes>
       </BrowserRouter>
     </ErrorBoundary>

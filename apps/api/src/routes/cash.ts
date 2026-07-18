@@ -7,10 +7,14 @@ import {
   refundEscrow,
   buildLockEscrowTransaction,
   submitSignedTransaction,
+  submitReleaseTx,
+  submitRefundTx,
+  NETWORK_PASSPHRASE,
 } from "../lib/stellar.js";
 import { sendRefundAlert } from "../lib/webhook.js";
 import { randomHex32 } from "../lib/crypto.js";
 import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders } from "../lib/store.js";
+import { notifyTradeStatus } from "./chat.js";
 import { parseBody } from "../lib/validation.js";
 import { sendNotification } from "../lib/notification.js";
 
@@ -27,6 +31,7 @@ const cashRequestSchema = z.object({
   mode: z.string().trim().optional(),
   notification_type: z.enum(["email", "sms", "none"]).optional(),
   contact_info: z.string().optional(),
+  signed_xdr: z.string().optional(),
 });
 
 type CashRequestBody = z.infer<typeof cashRequestSchema>;
@@ -85,11 +90,14 @@ function getDistanceFromLatLonInKm(lat1: number, lon1: number, lat2: number, lon
 /**
  * GET  /api/v1/cash/agents        — find nearby cash providers ($0.001)
  * POST /api/v1/cash/agents        — register a cash provider ($0.000)
- * POST /api/v1/cash/request       — lock funds via the escrow contract
+ * POST /api/v1/cash/request/prepare — lock funds via the escrow contract
  *                                    (custodial mode) or build an unsigned
  *                                    XDR for the buyer to sign (non_custodial
  *                                    mode); returns a claim_url + QR
  *                                    payload ($0.01)
+ * POST /api/v1/cash/request       — legacy one-shot custodial lock; returns
+ *                                    a claim_url + QR payload ($0.01)
+ *                                    (testnet-only; use /prepare on mainnet)
  * GET  /api/v1/cash/request/:id   — poll a pending cash request (free)
  * POST /api/v1/cash/request/:id/submit — submit a buyer-signed XDR from the
  *                                    non-custodial flow to finish locking
@@ -176,8 +184,27 @@ export async function cashRoutes(app: FastifyInstance) {
       reply.code(201).send(provider);
   });
 
-  app.post<{ Body: CashRequestBody }>(
-    "/cash/request",
+  const requestSchema = z.object({
+    seller: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
+    buyer: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
+    amount_stroops: z.string().trim().min(1).regex(/^\d+$/),
+    secret_hash: z.string().trim().length(64).regex(/^[0-9a-fA-F]+$/),
+  });
+
+  const prepareLockSchema = z.object({
+    seller: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
+    buyer: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
+    amount_stroops: z.string().trim().min(1).regex(/^\d+$/),
+    secret_hash: z.string().trim().length(64).regex(/^[0-9a-fA-F]+$/),
+    // Validated manually below (rather than via z.enum) so we can return the
+    // specific "mode must be either..." error message callers depend on.
+    mode: z.string().trim().optional(),
+    notification_type: z.enum(["email", "sms", "none"]).optional(),
+    contact_info: z.string().optional(),
+  });
+
+  app.post<{ Body: z.infer<typeof prepareLockSchema> }>(
+    "/cash/request/prepare",
     {
       config: {
         rateLimit: { max: 20, timeWindow: "1 minute" },
@@ -187,7 +214,7 @@ export async function cashRoutes(app: FastifyInstance) {
       const paid = await (app as any).requirePayment(req, reply, "0.01");
       if (!paid) return;
 
-      const body = parseBody(cashRequestSchema, req.body, reply);
+      const body = parseBody(prepareLockSchema, req.body, reply);
       if (!body) return;
 
       const { seller, buyer, amount_stroops, secret_hash, mode: rawMode, notification_type, contact_info } = body;
@@ -294,10 +321,7 @@ export async function cashRoutes(app: FastifyInstance) {
           reply.code(201).send({
             request_id: tradeId,
             unsigned_xdr: unsignedXdr,
-            network_passphrase:
-              process.env.STELLAR_NETWORK === "PUBLIC"
-                ? "Public Global Stellar Network ; September 2015"
-                : "Test SDF Network ; September 2015",
+            network_passphrase: NETWORK_PASSPHRASE,
             submit_url: `/api/v1/cash/request/${tradeId}/submit`,
             claim_url: `${baseUrl}/claim/${tradeId}`,
             qr_payload: qrPayload,
@@ -313,6 +337,94 @@ export async function cashRoutes(app: FastifyInstance) {
           return;
         }
       }
+    }
+  );
+
+  app.post<{ Body: z.infer<typeof cashRequestSchema> }>(
+    "/cash/request",
+    {
+      config: {
+        rateLimit: { max: 20, timeWindow: "1 minute" },
+      },
+    },
+    async (req, reply) => {
+      const paid = await (app as any).requirePayment(req, reply, "0.01");
+      if (!paid) return;
+
+      const body = parseBody(cashRequestSchema, req.body, reply);
+      if (!body) return;
+
+      const { seller, buyer, amount_stroops, secret_hash, notification_type, contact_info } = body;
+
+      if (notification_type && notification_type !== "none") {
+        if (!contact_info) {
+          reply.code(400).send({ error: "contact_info is required when notification_type is specified" });
+          return;
+        }
+        if (notification_type === "email") {
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+          if (!emailRegex.test(contact_info)) {
+            reply.code(400).send({ error: "Invalid email address format for contact_info" });
+            return;
+          }
+        } else if (notification_type === "sms") {
+          const phoneRegex = /^\+?[1-9]\d{5,14}$/;
+          if (!phoneRegex.test(contact_info)) {
+            reply.code(400).send({ error: "Invalid phone number format for contact_info" });
+            return;
+          }
+        }
+      }
+
+      // Legacy custodial-only path. Non-custodial callers should use
+      // POST /cash/request/prepare (mode: "non_custodial") followed by
+      // POST /cash/request/:id/submit instead — this endpoint always
+      // generates a fresh trade ID, so it cannot be paired with a
+      // signed XDR built against some other trade ID.
+      const tradeId = randomHex32();
+
+      try {
+        await lockEscrow({
+          contractId: ESCROW_CONTRACT_ID,
+          tradeId,
+          seller,
+          buyer,
+          amountStroops: BigInt(amount_stroops),
+          secretHashHex: secret_hash,
+          timeoutLedgers: DEFAULT_TIMEOUT_LEDGERS,
+        });
+      } catch (err) {
+        req.log.error(err, "lockEscrow failed");
+        reply.code(502).send({
+          error: "escrow lock failed",
+          detail: String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+        return;
+      }
+
+      const qrPayload = `velo://claim?request_id=${tradeId}&contract=${ESCROW_CONTRACT_ID}`;
+      saveCashRequest({
+        id: tradeId,
+        contractId: ESCROW_CONTRACT_ID,
+        seller,
+        buyer,
+        amountStroops: amount_stroops,
+        secretHex: "",
+        secretHashHex: secret_hash,
+        qrPayload,
+        status: "locked",
+        createdAt: new Date().toISOString(),
+        notificationType: notification_type,
+        contactInfo: contact_info,
+      });
+
+      const baseUrl = process.env.FRONTEND_BASE_URL ?? "https://app.velo.cash";
+      reply.code(201).send({
+        claim_url: `${baseUrl}/claim/${tradeId}`,
+        qr_payload: qrPayload,
+        instructions: "Show this QR to the cash provider to receive your cash.",
+      });
     }
   );
 
@@ -379,7 +491,7 @@ export async function cashRoutes(app: FastifyInstance) {
     }
   );
 
-  app.post<{ Params: { id: string }; Body: { secret: string } }>(
+  app.post<{ Params: { id: string }; Body: { secret?: string; signed_xdr?: string } }>(
     "/cash/request/:id/release",
     {
       config: {
@@ -398,33 +510,50 @@ export async function cashRoutes(app: FastifyInstance) {
       }
 
       const releaseBody = parseBody(
-        z.object({ secret: z.string().trim().min(1) }),
+        z.object({
+          secret: z.string().trim().min(1).optional(),
+          signed_xdr: z.string().trim().min(1).optional(),
+        }),
         req.body,
         reply
       );
       if (!releaseBody) return;
 
-      const { secret } = releaseBody;
+      const { secret, signed_xdr } = releaseBody;
 
-      try {
-        await releaseEscrow({
-          contractId: record.contractId,
-          tradeId: record.id,
-          secretHex: secret,
-        });
-      } catch (err) {
-        req.log.error(err, "releaseEscrow failed");
-        reply.code(502).send({ error: "escrow release failed", detail: String(err) });
+      if (signed_xdr) {
+        try {
+          await submitReleaseTx(signed_xdr);
+        } catch (err) {
+          req.log.error(err, "submitReleaseTx failed");
+          reply.code(502).send({ error: "release submission failed", detail: String(err) });
+          return;
+        }
+      } else if (secret) {
+        try {
+          await releaseEscrow({
+            contractId: record.contractId,
+            tradeId: record.id,
+            secretHex: secret,
+          });
+        } catch (err) {
+          req.log.error(err, "releaseEscrow failed");
+          reply.code(502).send({ error: "escrow release failed", detail: String(err) });
+          return;
+        }
+      } else {
+        reply.code(400).send({ error: "either secret or signed_xdr is required" });
         return;
       }
 
       updateStatus(record.id, "released");
+      notifyTradeStatus(record.id, "released");
       await sendNotification(record, "released");
       return { id: record.id, status: "released" };
     }
   );
 
-  app.post<{ Params: { id: string } }>(
+  app.post<{ Params: { id: string }; Body: { signed_xdr?: string } }>(
     "/cash/request/:id/refund",
     {
       config: {
@@ -442,18 +571,36 @@ export async function cashRoutes(app: FastifyInstance) {
         return;
       }
 
-      try {
-        await refundEscrow({
-          contractId: record.contractId,
-          tradeId: record.id,
-        });
-      } catch (err) {
-        req.log.error(err, "refundEscrow failed");
-        reply.code(502).send({ error: "escrow refund failed", detail: String(err) });
-        return;
+      const refundBody = parseBody(
+        z.object({ signed_xdr: z.string().trim().min(1).optional() }),
+        req.body ?? {},
+        reply
+      );
+      if (!refundBody) return;
+
+      if (refundBody.signed_xdr) {
+        try {
+          await submitRefundTx(refundBody.signed_xdr);
+        } catch (err) {
+          req.log.error(err, "submitRefundTx failed");
+          reply.code(502).send({ error: "refund submission failed", detail: String(err) });
+          return;
+        }
+      } else {
+        try {
+          await refundEscrow({
+            contractId: record.contractId,
+            tradeId: record.id,
+          });
+        } catch (err) {
+          req.log.error(err, "refundEscrow failed");
+          reply.code(502).send({ error: "escrow refund failed", detail: String(err) });
+          return;
+        }
       }
 
       updateStatus(record.id, "refunded");
+      notifyTradeStatus(record.id, "refunded");
       await sendNotification(record, "refunded");
 
       sendRefundAlert({
