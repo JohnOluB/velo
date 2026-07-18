@@ -24,6 +24,7 @@ const cashRequestSchema = z.object({
   secret_hash: z.string().trim().length(64).regex(/^[0-9a-fA-F]+$/),
   notification_type: z.enum(["email", "sms", "none"]).optional(),
   contact_info: z.string().optional(),
+  signed_xdr: z.string().optional(),
 });
 
 type CashRequestBody = z.infer<typeof cashRequestSchema>;
@@ -181,6 +182,8 @@ export async function cashRoutes(app: FastifyInstance) {
     buyer: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
     amount_stroops: z.string().trim().min(1).regex(/^\d+$/),
     secret_hash: z.string().trim().length(64).regex(/^[0-9a-fA-F]+$/),
+    notification_type: z.enum(["email", "sms", "none"]).optional(),
+    contact_info: z.string().optional(),
   });
 
   app.post<{ Body: z.infer<typeof prepareLockSchema> }>(
@@ -197,7 +200,6 @@ export async function cashRoutes(app: FastifyInstance) {
       const body = parseBody(prepareLockSchema, req.body, reply);
       if (!body) return;
 
-      const { seller, buyer, amount_stroops, secret_hash } = body;
       const { seller, buyer, amount_stroops, secret_hash, notification_type, contact_info } = body;
 
       if (notification_type && notification_type !== "none") {
@@ -302,14 +304,6 @@ export async function cashRoutes(app: FastifyInstance) {
     }
   );
 
-  const cashRequestSchema = z.object({
-    seller: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
-    buyer: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
-    amount_stroops: z.string().trim().min(1).regex(/^\d+$/),
-    secret_hash: z.string().trim().length(64).regex(/^[0-9a-fA-F]+$/),
-    signed_xdr: z.string().optional(),
-  });
-
   app.post<{ Body: z.infer<typeof cashRequestSchema> }>(
     "/cash/request",
     {
@@ -324,7 +318,27 @@ export async function cashRoutes(app: FastifyInstance) {
       const body = parseBody(cashRequestSchema, req.body, reply);
       if (!body) return;
 
-      const { seller, buyer, amount_stroops, secret_hash, signed_xdr } = body;
+      const { seller, buyer, amount_stroops, secret_hash, signed_xdr, notification_type, contact_info } = body;
+
+      if (notification_type && notification_type !== "none") {
+        if (!contact_info) {
+          reply.code(400).send({ error: "contact_info is required when notification_type is specified" });
+          return;
+        }
+        if (notification_type === "email") {
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+          if (!emailRegex.test(contact_info)) {
+            reply.code(400).send({ error: "Invalid email address format for contact_info" });
+            return;
+          }
+        } else if (notification_type === "sms") {
+          const phoneRegex = /^\+?[1-9]\d{5,14}$/;
+          if (!phoneRegex.test(contact_info)) {
+            reply.code(400).send({ error: "Invalid phone number format for contact_info" });
+            return;
+          }
+        }
+      }
 
       const tradeId = randomHex32();
 
@@ -483,7 +497,7 @@ export async function cashRoutes(app: FastifyInstance) {
 
       const refundBody = parseBody(
         z.object({ signed_xdr: z.string().trim().min(1).optional() }),
-        req.body,
+        req.body ?? {},
         reply
       );
       if (!refundBody) return;
