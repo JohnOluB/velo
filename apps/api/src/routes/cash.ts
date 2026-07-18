@@ -12,6 +12,7 @@ import { randomHex32 } from "../lib/crypto.js";
 import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders } from "../lib/store.js";
 import { notifyTradeStatus } from "./chat.js";
 import { parseBody } from "../lib/validation.js";
+import { sendNotification } from "../lib/notification.js";
 
 const ESCROW_CONTRACT_ID = process.env.ESCROW_CONTRACT_ID ?? CONTRACTS.testnet.escrow;
 const DEFAULT_TIMEOUT_LEDGERS = 100; // ~15-20 min at Stellar's ~5-6s ledger close time
@@ -21,6 +22,8 @@ const cashRequestSchema = z.object({
   buyer: z.string().trim().min(1).regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/),
   amount_stroops: z.string().trim().min(1).regex(/^\d+$/),
   secret_hash: z.string().trim().length(64).regex(/^[0-9a-fA-F]+$/),
+  notification_type: z.enum(["email", "sms", "none"]).optional(),
+  contact_info: z.string().optional(),
 });
 
 type CashRequestBody = z.infer<typeof cashRequestSchema>;
@@ -195,6 +198,28 @@ export async function cashRoutes(app: FastifyInstance) {
       if (!body) return;
 
       const { seller, buyer, amount_stroops, secret_hash } = body;
+      const { seller, buyer, amount_stroops, secret_hash, notification_type, contact_info } = body;
+
+      if (notification_type && notification_type !== "none") {
+        if (!contact_info) {
+          reply.code(400).send({ error: "contact_info is required when notification_type is specified" });
+          return;
+        }
+        if (notification_type === "email") {
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+          if (!emailRegex.test(contact_info)) {
+            reply.code(400).send({ error: "Invalid email address format for contact_info" });
+            return;
+          }
+        } else if (notification_type === "sms") {
+          const phoneRegex = /^\+?[1-9]\d{5,14}$/;
+          if (!phoneRegex.test(contact_info)) {
+            reply.code(400).send({ error: "Invalid phone number format for contact_info" });
+            return;
+          }
+        }
+      }
+
       const tradeId = randomHex32();
 
       try {
@@ -345,12 +370,14 @@ export async function cashRoutes(app: FastifyInstance) {
         qrPayload,
         status: "locked",
         createdAt: new Date().toISOString(),
+        notificationType: notification_type,
+        contactInfo: contact_info,
       });
 
       const baseUrl = process.env.FRONTEND_BASE_URL ?? "https://app.velo.cash";
       reply.code(201).send({
         claim_url: `${baseUrl}/claim/${tradeId}`,
-        qr_payload: `velo://claim?request_id=${tradeId}&contract=${ESCROW_CONTRACT_ID}`,
+        qr_payload: qrPayload,
         instructions: "Show this QR to the cash provider to receive your cash.",
       });
     }
@@ -431,6 +458,7 @@ export async function cashRoutes(app: FastifyInstance) {
 
       updateStatus(record.id, "released");
       notifyTradeStatus(record.id, "released");
+      await sendNotification(record, "released");
       return { id: record.id, status: "released" };
     }
   );
@@ -483,6 +511,7 @@ export async function cashRoutes(app: FastifyInstance) {
 
       updateStatus(record.id, "refunded");
       notifyTradeStatus(record.id, "refunded");
+      await sendNotification(record, "refunded");
 
       sendRefundAlert({
         tradeId: record.id,
