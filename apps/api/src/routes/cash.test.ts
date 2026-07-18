@@ -40,7 +40,6 @@ describe("cashRoutes", () => {
       return true;
     });
 
-<<<<<<< HEAD
     app.register(cashRoutes, { prefix: "/api/v1" });
   };
 
@@ -327,6 +326,3 @@ describe("cashRoutes", () => {
     await app.close();
   });
 });
-=======
- /�E�"�׫���zƩ�����^�Ƭ�.��)���������m���r
->>>>>>> aa7e78f (Fix CI build errors and format rules)

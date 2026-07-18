@@ -320,7 +320,7 @@ mod test {
 
         let contract_id = env.register_contract(None, EscrowContract);
         let client = EscrowContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &token_addr, &fee_bps).unwrap();
+        client.initialize(&admin, &token_addr, &fee_bps);
 
         let secret = BytesN::from_array(&env, &[7u8; 32]);
         let secret_hash = env.crypto().sha256(&secret.clone().into()).to_bytes();
