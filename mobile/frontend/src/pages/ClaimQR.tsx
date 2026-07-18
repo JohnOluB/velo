@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useParams, useSearchParams, useNavigate } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
-import { useCallback, useEffect, useState } from 'react';
-import { useParams, useSearchParams } from 'react-router-dom';
-import { QRCodeSVG } from 'qrcode.react';
 import {
   fetchCashRequest,
   releaseCashRequest,
@@ -260,7 +257,6 @@ export default function ClaimQR() {
           </div>
         )}
 
-        {status.status === "locked" && secret && (
         {status.status === 'locked' && secret && (
           <details className="claim-ticket__debug">
             <summary>Testnet: simulate provider scan</summary>
