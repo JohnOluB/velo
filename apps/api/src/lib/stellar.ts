@@ -183,6 +183,7 @@ export interface LockParams {
     amountStroops: bigint;
     secretHashHex: string;
     timeoutLedgers: number;
+    signerPublicKey?: string; // For non-custodial mode
 }
 
 /** Build and simulate a lock() transaction, returning unsigned XDR. */
@@ -225,6 +226,44 @@ export async function lockEscrow(params: LockParams) {
     );
 }
 
+/**
+ * Builds an unsigned transaction for the escrow lock operation.
+ * Returns the unsigned XDR transaction base64 string for client-side signing.
+ */
+export async function buildLockEscrowTransaction(params: LockParams): Promise<string> {
+    const signerPublicKey = params.signerPublicKey || loadSignerKeypair().publicKey();
+    const account = await server.getAccount(signerPublicKey);
+
+    const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+    })
+        .addOperation(
+            Operation.invokeContractFunction({
+                contract: params.contractId,
+                function: "lock",
+                args: [
+                    hexToBytesScVal(params.tradeId),
+                    nativeToScVal(params.seller, { type: "address" }),
+                    nativeToScVal(params.buyer, { type: "address" }),
+                    nativeToScVal(params.amountStroops, { type: "i128" }),
+                    hexToBytesScVal(params.secretHashHex),
+                    nativeToScVal(params.timeoutLedgers, { type: "u32" }),
+                ],
+            })
+        )
+        .setTimeout(30)
+        .build();
+
+    const sim = await server.simulateTransaction(tx);
+    if (Api.isSimulationError(sim)) {
+        throw new Error(`simulation failed: ${sim.error}`);
+    }
+
+    const prepared = assembleTransaction(tx, sim).build();
+    return prepared.toXDR();
+}
+
 export interface ReleaseParams {
     contractId: string;
     tradeId: string;
@@ -257,6 +296,37 @@ export async function releaseEscrow(params: ReleaseParams) {
     );
 }
 
+/**
+ * Builds an unsigned transaction for the escrow release operation.
+ * Returns the unsigned XDR transaction base64 string for client-side signing.
+ */
+export async function buildReleaseEscrowTransaction(params: ReleaseParams & { signerPublicKey?: string }): Promise<string> {
+    const signerPublicKey = params.signerPublicKey || loadSignerKeypair().publicKey();
+    const account = await server.getAccount(signerPublicKey);
+
+    const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+    })
+        .addOperation(
+            Operation.invokeContractFunction({
+                contract: params.contractId,
+                function: "release",
+                args: [hexToBytesScVal(params.tradeId), hexToBytesScVal(params.secretHex)],
+            })
+        )
+        .setTimeout(30)
+        .build();
+
+    const sim = await server.simulateTransaction(tx);
+    if (Api.isSimulationError(sim)) {
+        throw new Error(`simulation failed: ${sim.error}`);
+    }
+
+    const prepared = assembleTransaction(tx, sim).build();
+    return prepared.toXDR();
+}
+
 export interface RefundParams {
     contractId: string;
     tradeId: string;
@@ -286,4 +356,63 @@ export async function refundEscrow(params: RefundParams) {
         [hexToBytesScVal(params.tradeId)],
         signer,
     );
+}
+
+/**
+ * Builds an unsigned transaction for the escrow refund operation.
+ * Returns the unsigned XDR transaction base64 string for client-side signing.
+ */
+export async function buildRefundEscrowTransaction(params: RefundParams & { signerPublicKey?: string }): Promise<string> {
+    const signerPublicKey = params.signerPublicKey || loadSignerKeypair().publicKey();
+    const account = await server.getAccount(signerPublicKey);
+
+    const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+    })
+        .addOperation(
+            Operation.invokeContractFunction({
+                contract: params.contractId,
+                function: "refund",
+                args: [hexToBytesScVal(params.tradeId)],
+            })
+        )
+        .setTimeout(30)
+        .build();
+
+    const sim = await server.simulateTransaction(tx);
+    if (Api.isSimulationError(sim)) {
+        throw new Error(`simulation failed: ${sim.error}`);
+    }
+
+    const prepared = assembleTransaction(tx, sim).build();
+    return prepared.toXDR();
+}
+
+/**
+ * Submits a signed transaction XDR to the Stellar network.
+ * Waits for transaction confirmation and returns the result.
+ */
+export async function submitSignedTransaction(signedXdr: string): Promise<{ hash: string; status: string }> {
+    const tx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+    const sendResult = await server.sendTransaction(tx);
+    if (sendResult.status === "ERROR") {
+        throw new Error(`submission failed: ${JSON.stringify(sendResult.errorResult)}`);
+    }
+
+    let getResult = await server.getTransaction(sendResult.hash);
+    const start = Date.now();
+    while (getResult.status === Api.GetTransactionStatus.NOT_FOUND) {
+        if (Date.now() - start > 30_000) {
+            throw new Error(`timed out waiting for tx ${sendResult.hash} to confirm`);
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+        getResult = await server.getTransaction(sendResult.hash);
+    }
+
+    if (getResult.status !== Api.GetTransactionStatus.SUCCESS) {
+        throw new Error(`tx ${sendResult.hash} failed with status ${getResult.status}`);
+    }
+
+    return { hash: sendResult.hash, status: getResult.status };
 }

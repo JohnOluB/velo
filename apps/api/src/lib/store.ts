@@ -14,7 +14,7 @@ export interface CashRequestRecord {
     secretHex: string; // TODO: don't store server-side long-term — see note below
     secretHashHex: string;
     qrPayload: string; // safe to persist — contains no secret, only request_id + contract
-    status: "locked" | "released" | "refunded";
+    status: "locked" | "released" | "refunded" | "pending_signature";
     createdAt: string;
     notificationType?: "email" | "sms" | "none";
     contactInfo?: string;
@@ -70,6 +70,7 @@ export function getStoreStats() {
             locked: requests.filter(r => r.status === "locked").length,
             released: requests.filter(r => r.status === "released").length,
             refunded: requests.filter(r => r.status === "refunded").length,
+            pending_signature: requests.filter(r => r.status === "pending_signature").length,
         },
     };
 }
