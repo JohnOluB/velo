@@ -5,6 +5,15 @@ import { notifyTradeStatus } from "./chat.js";
 import { z } from "zod";
 import { parseBody } from "../lib/validation.js";
 
+// Basic schema for body validation
+interface FlagRequestBody {
+  suspicious: boolean;
+  notes?: string;
+}
+
+interface OverrideHeader {
+  'x-admin-api-key': string;
+}
 export async function adminRoutes(app: FastifyInstance) {
   app.addHook("preHandler", async (req: FastifyRequest, reply: FastifyReply) => {
     const adminKey = req.headers["x-admin-api-key"];
@@ -77,4 +86,13 @@ export async function adminRoutes(app: FastifyInstance) {
       });
     }
   );
+  app.get("/admin/status", async (req, reply) => {
+    return {
+      ok: true,
+      version: "0.1.0",
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      store: getStoreStats(),
+    };
+  });
 }
