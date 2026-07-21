@@ -778,3 +778,6 @@ mod test {
         assert!(m.f.client.try_set_platform_fee(&300, &stale).is_err());
     }
 }
+
+#[cfg(test)]
+mod property_test;
