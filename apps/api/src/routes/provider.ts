@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { randomUUID } from "crypto";
 import { getProviderTrades, saveProvider, getProviders, ProviderRecord } from "../lib/store.js";
+import { toPublicProvider, DEFAULT_PRECISION } from "../utils/privacy.js";
 
 const registerProviderSchema = z.object({
   stellar_address: z.string().trim().regex(/^G[1-9A-HJ-NP-Za-km-z]{55}$/, "Invalid Stellar address format"),
@@ -100,17 +101,35 @@ export async function providerRoutes(app: FastifyInstance) {
   app.post("/provider/register", async (req, reply) => handleProviderRegistration(req, reply, app));
   app.post("/providers/register", async (req, reply) => handleProviderRegistration(req, reply, app));
 
-  // GET /providers — List registered providers
+  // GET /providers — List registered providers.
+  // The public directory never exposes exact coordinates: each provider is
+  // generalized to a coarse geohash cell (issue #216). Exact location is only
+  // available via the reveal-on-match path once an escrow is locked.
   app.get("/providers", async (req, reply) => {
+    let records: ProviderRecord[] = [];
     if ((app as any).pg) {
       try {
         const { rows } = await (app as any).pg.query("SELECT * FROM providers ORDER BY created_at DESC");
-        return reply.send({ providers: rows });
+        records = rows.map((r: any) => ({
+          id: r.id,
+          stellarAddress: r.stellar_address,
+          name: r.name,
+          lat: Number(r.latitude),
+          lng: Number(r.longitude),
+          tier: r.tier ?? "Probationary",
+          rate: String(r.rate),
+          status: r.availability ?? "available",
+          kycStatus: r.kyc_status ?? "pending",
+          createdAt: r.created_at,
+        }));
       } catch (err) {
         req.log.error(err, "Failed to fetch providers from database");
+        records = getProviders();
       }
+    } else {
+      records = getProviders();
     }
-    return reply.send({ providers: getProviders() });
+    return reply.send({ providers: records.map((p) => toPublicProvider(p, undefined, DEFAULT_PRECISION)) });
   });
 
   app.get("/provider/dashboard", async (req, reply) => {
