@@ -11,7 +11,7 @@ export default function Chat() {
   const navigate = useNavigate();
 
   const [input, setInput] = useState("");
-  const { messages, send, connected, closed } = useChat({
+  const { messages, send, connected, closed, canSend, safetyNumber, keyChanged, acknowledgeKeyChange } = useChat({
     tradeId: tradeId ?? "",
     participant,
   });
@@ -47,9 +47,23 @@ export default function Chat() {
           </span>
         </div>
 
+        <div className="chat-encryption-bar">
+          <span className="chat-encryption-badge">🔒 End-to-end encrypted</span>
+          {safetyNumber && <span className="chat-safety-number" title="Compare this code with the other participant in person to confirm your connection hasn't been tampered with.">{safetyNumber}</span>}
+        </div>
+
+        {keyChanged && (
+          <div className="chat-key-warning">
+            <p>⚠️ The other participant's security code changed. Verify it matches before continuing.</p>
+            <button className="chat-key-warning__ack" onClick={acknowledgeKeyChange}>I've verified, continue</button>
+          </div>
+        )}
+
         <div className="chat-messages" role="log" aria-live="polite">
           {messages.length === 0 && (
-            <p className="chat-empty">No messages yet. Say hello!</p>
+            <p className="chat-empty">
+              {canSend ? "No messages yet. Say hello!" : "Waiting for the other participant to connect securely..."}
+            </p>
           )}
           {messages.map((msg) => (
             <div
@@ -57,7 +71,9 @@ export default function Chat() {
               className={`chat-bubble ${msg.sender === participant ? "chat-bubble--self" : "chat-bubble--other"}`}
             >
               <span className="chat-bubble__sender">{shortAddress(msg.sender)}</span>
-              <p className="chat-bubble__text">{msg.text}</p>
+              <p className="chat-bubble__text">
+                {msg.text ?? <em className="chat-bubble__undecryptable">Unable to decrypt this message.</em>}
+              </p>
               <span className="chat-bubble__time">
                 {new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
               </span>
@@ -78,12 +94,12 @@ export default function Chat() {
           <input
             className="chat-input"
             type="text"
-            placeholder="Type a message..."
+            placeholder={canSend ? "Type a message..." : "Waiting for secure connection..."}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            disabled={!connected}
+            disabled={!canSend}
           />
-          <button className="chat-send" type="submit" disabled={!connected || !input.trim()}>
+          <button className="chat-send" type="submit" disabled={!canSend || !input.trim()}>
             Send
           </button>
         </form>
