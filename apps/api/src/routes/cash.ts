@@ -15,9 +15,11 @@ import {
 import { sendRefundAlert } from "../lib/webhook.js";
 import { notifyTradeStatus } from "./chat.js";
 import { randomHex32 } from "../lib/crypto.js";
-import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders, countProvidersByNetwork } from "../lib/store.js";
+import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders, countProvidersByNetwork, getProviderByAddress } from "../lib/store.js";
 import { parseBody } from "../lib/validation.js";
 import { sendNotification } from "../lib/notification.js";
+import { toPublicProvider, withinRadius, applyKAnonymity, DEFAULT_PRECISION } from "../utils/privacy.js";
+import { cellFor, haversineKm, GEOHASH_CELL_SIZE_METERS } from "../utils/geohash.js";
 
 const ESCROW_CONTRACT_ID = process.env.ESCROW_CONTRACT_ID ?? CONTRACTS.testnet.escrow;
 const DEFAULT_TIMEOUT_LEDGERS = 100; // ~15-20 min at Stellar's ~5-6s ledger close time
@@ -45,49 +47,9 @@ interface RegisterProviderBody {
   device_id?: string;
 }
 
-interface BoundingBox {
-  minLat: number;
-  maxLat: number;
-  minLng: number;
-  maxLng: number;
-}
-
-/**
- * Calculates bounding-box coordinates for a given search point and radius.
- * @param lat Target Latitude (degrees)
- * @param lng Target Longitude (degrees)
- * @param radiusInKm Search radius in kilometers (defaults to 5km)
- */
-function getBoundingBox(lat: number, lng: number, radiusInKm: number): BoundingBox {
-  const kmPerDegreeLat = 111;
-  // Account for longitude shrinkage as we move away from the equator
-  const kmPerDegreeLng = 111 * Math.cos(lat * (Math.PI / 180));
-
-  const latDelta = radiusInKm / kmPerDegreeLat;
-  const lngDelta = radiusInKm / kmPerDegreeLng;
-
-  return {
-    minLat: lat - latDelta,
-    maxLat: lat + latDelta,
-    minLng: lng - lngDelta,
-    maxLng: lng + lngDelta,
-  };
-}
-
-/**
- * Simple Haversine distance formula to calculate exact path distance
- */
-function getDistanceFromLatLonInKm(lat1: number, lon1: number, lat2: number, lon2: number) {
-  const R = 6371; // Radius of the earth in km
-  const dLat = (lat2 - lat1) * (Math.PI / 180);
-  const dLon = (lon2 - lon1) * (Math.PI / 180);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
+// Proximity matching is privacy-preserving: providers are generalized to a
+// geohash cell and never returned with exact coordinates (issue #216). See
+// ../utils/privacy.ts and docs/privacy/proximity-matching.md.
 
 /**
  * GET  /api/v1/cash/agents        — find nearby cash providers ($0.001)
@@ -111,7 +73,7 @@ function getDistanceFromLatLonInKm(lat1: number, lon1: number, lat2: number, lon
  *                                    if the trade times out or fails (free)
  */
 export async function cashRoutes(app: FastifyInstance) {
-  app.get<{ Querystring: { lat?: string; lng?: string; radius?: string } }>(
+  app.get<{ Querystring: { lat?: string; lng?: string; radius?: string; precision?: string; k?: string } }>(
     "/cash/agents",
     {
       config: {
@@ -122,8 +84,22 @@ export async function cashRoutes(app: FastifyInstance) {
       const paid = await (app as any).requirePayment(req, reply, "0.001");
       if (!paid) return;
 
-      const { lat, lng, radius } = req.query;
+      const { lat, lng, radius, precision, k } = req.query;
       const providers = getProviders().filter(p => p.status === "available");
+      const prec = precision ? parseInt(precision, 10) : DEFAULT_PRECISION;
+      const kAnon = k ? parseInt(k, 10) : 1;
+
+      if (Number.isNaN(prec) || prec < 4 || prec > 8) {
+        reply.code(400).send({ error: "precision must be an integer between 4 and 8" });
+        return;
+      }
+
+      const privacyMeta = {
+        precision: prec,
+        cell_size_m: GEOHASH_CELL_SIZE_METERS[prec],
+        k_anonymity: kAnon,
+        note: "Locations are generalized to a geohash cell; exact coordinates are revealed only to a confirmed match.",
+      };
 
       if (lat && lng) {
         const userLat = parseFloat(lat);
@@ -135,30 +111,29 @@ export async function cashRoutes(app: FastifyInstance) {
           return;
         }
 
-        // 1. Obtain bounding box
-        const box = getBoundingBox(userLat, userLng, searchRadiusKm);
+        // Filter at cell granularity (never by exact distance), then sort by the
+        // cell-centroid distance computed server-side. Only the coarse public
+        // view (cell + quantized band) is returned.
+        const inRange = withinRadius(providers, { lat: userLat, lng: userLng }, searchRadiusKm, prec);
+        const queryCell = cellFor(userLat, userLng, prec);
+        inRange.sort((a, b) => {
+          const ca = cellFor(a.lat, a.lng, prec);
+          const cb = cellFor(b.lat, b.lng, prec);
+          return (
+            haversineKm(queryCell.lat, queryCell.lon, ca.lat, ca.lon) -
+            haversineKm(queryCell.lat, queryCell.lon, cb.lat, cb.lon)
+          );
+        });
 
-        // 2. High-speed Bounding-box pre-filtering
-        const candidates = providers.filter(p =>
-          p.lat >= box.minLat && p.lat <= box.maxLat &&
-          p.lng >= box.minLng && p.lng <= box.maxLng
-        );
-
-        // 3. Exact distance calculation on remaining filtered candidates
-        const withDistance = candidates
-          .map(p => ({
-            ...p,
-            distance_km: parseFloat(getDistanceFromLatLonInKm(userLat, userLng, p.lat, p.lng).toFixed(2))
-          }))
-          // Prune out mathematical corner cases falling in the box but outside the circle radius
-          .filter(p => p.distance_km <= searchRadiusKm);
-
-        withDistance.sort((a, b) => a.distance_km - b.distance_km);
-        return { agents: withDistance };
+        let agents = inRange.map(p => toPublicProvider(p, { lat: userLat, lng: userLng, precision: prec }, prec));
+        agents = applyKAnonymity(agents, kAnon);
+        return { agents, privacy: privacyMeta };
       }
 
-      // Default if no coordinates are provided
-      return { agents: providers };
+      // Default if no coordinates are provided: still coarse, no exact coords.
+      let agents = providers.map(p => toPublicProvider(p, undefined, prec));
+      agents = applyKAnonymity(agents, kAnon);
+      return { agents, privacy: privacyMeta };
     }
   );
 
@@ -458,6 +433,47 @@ export async function cashRoutes(app: FastifyInstance) {
       }
       const { secretHex: _omit, ...safe } = record;
       return safe;
+    }
+  );
+
+  // Reveal-on-match: exact provider coordinates are released ONLY once buyer and
+  // provider share a confirmed escrow (locked/released/disputed). A requester
+  // with no such match can never obtain precise coordinates from the API — the
+  // discovery endpoints expose only coarse geohash cells (issue #216).
+  app.get<{ Params: { id: string } }>(
+    "/cash/request/:id/provider-location",
+    {
+      config: {
+        rateLimit: { max: 30, timeWindow: "1 minute" },
+      },
+    },
+    async (req, reply) => {
+      const record = getCashRequest(req.params.id);
+      if (!record) {
+        reply.code(404).send({ error: "request not found" });
+        return;
+      }
+      const matched = record.status === "locked" || record.status === "released" || record.status === "disputed";
+      if (!matched) {
+        reply.code(403).send({
+          error: "location is revealed only after a match is confirmed (escrow locked)",
+          status: record.status,
+        });
+        return;
+      }
+      const provider = getProviderByAddress(record.seller);
+      if (!provider) {
+        reply.code(404).send({ error: "no registered provider for this trade" });
+        return;
+      }
+      return {
+        request_id: record.id,
+        provider_id: provider.id,
+        name: provider.name,
+        stellar_address: provider.stellarAddress ?? record.seller,
+        lat: provider.lat,
+        lng: provider.lng,
+      };
     }
   );
 
