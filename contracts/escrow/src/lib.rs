@@ -48,9 +48,27 @@ pub enum Error {
     InvalidSigners = 16,
     AlreadyMigrated = 17,
     DuplicateSigner = 18,
+    BatchTooLarge = 19,
 }
 
 const DEFAULT_TIMEOUT_LEDGERS_MAX: u32 = 6 * 60 * 24 * 7;
+
+/// Caps how many trades a single `batch_release()` invocation may touch.
+/// Soroban's per-invocation compute budget grows with each additional
+/// token transfer + storage write, so this bounds worst-case resource
+/// usage rather than relying on the caller to behave. See
+/// docs/provider-payout-batching.md for the reasoning behind this figure.
+const MAX_BATCH_SIZE: u32 = 25;
+
+/// One entry in a `batch_release()` call: the trade to release and the
+/// secret that unlocks it. Mirrors the arguments `release()` already takes,
+/// just packaged so many can travel in one Soroban invocation.
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchReleaseItem {
+    pub id: BytesN<32>,
+    pub secret: BytesN<32>,
+}
 
 #[contract]
 pub struct EscrowContract;
@@ -258,6 +276,71 @@ impl EscrowContract {
         require_multisig(&env, &signers)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         Ok(())
+    }
+
+    /// Release many trades in a single invocation — the on-chain half of
+    /// provider payout batching (see docs/provider-payout-batching.md).
+    ///
+    /// This is permissionless, exactly like `release()`: each item is
+    /// verified independently against its own trade's `secret_hash`, so
+    /// batching never lets one trade's payout ride on another's
+    /// authorization. An item that doesn't correspond to a `Locked` trade,
+    /// or whose secret doesn't match, is silently skipped rather than
+    /// reverting the whole batch — one stale or malformed entry must not
+    /// be able to block payout for every other provider in the batch.
+    /// Returns the ids that were actually released, so the caller can
+    /// retry whatever didn't make it.
+    pub fn batch_release(
+        env: Env,
+        releases: Vec<BatchReleaseItem>,
+    ) -> Result<Vec<BytesN<32>>, Error> {
+        if releases.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+
+        let mut released: Vec<BytesN<32>> = Vec::new(&env);
+        for item in releases.iter() {
+            let key = DataKey::Trade(item.id.clone());
+            let mut state: TradeState = match env.storage().persistent().get(&key) {
+                Some(s) => s,
+                None => continue,
+            };
+            if state.status != TradeStatus::Locked {
+                continue;
+            }
+
+            let computed = env.crypto().sha256(&item.secret.clone().into());
+            if computed.to_bytes() != state.secret_hash {
+                continue;
+            }
+
+            let fee = (state.amount * fee_bps as i128) / 10_000;
+            let payout = state.amount - fee;
+
+            // CEI pattern, same as release(): update state before external calls.
+            state.status = TradeStatus::Released;
+            env.storage().persistent().set(&key, &state);
+
+            client.transfer(&env.current_contract_address(), &state.seller, &payout);
+            if fee > 0 {
+                client.transfer(&env.current_contract_address(), &admin, &fee);
+            }
+
+            env.events()
+                .publish((symbol_short(&env, "released"), item.id.clone()), payout);
+            released.push_back(item.id.clone());
+        }
+
+        Ok(released)
     }
 }
 
@@ -776,5 +859,138 @@ mod test {
         // The rotated-out key no longer counts toward a quorum.
         let stale = vec![&m.f.env, m.s1.clone(), m.s2.clone()];
         assert!(m.f.client.try_set_platform_fee(&300, &stale).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Provider payout batching: batch_release().
+    //
+    // An off-chain coordinator accumulates trades whose secrets are
+    // already known (revealed at hand-off) and submits them together in
+    // one Soroban invocation to amortize the base fee across trades.
+    // These tests check the property that actually matters: batching must
+    // not weaken release()'s per-trade guarantee — each item is verified
+    // against its own trade's secret_hash independently, so one bad or
+    // stale entry can never ride on, or block, another trade's payout.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn batch_release_pays_multiple_sellers_in_one_call() {
+        let f = setup(2_000, 100); // 1% fee
+        let seller2 = Address::generate(&f.env);
+        let secret2 = BytesN::from_array(&f.env, &[8u8; 32]);
+        let secret_hash2 = f.env.crypto().sha256(&secret2.clone().into()).to_bytes();
+        let id2 = BytesN::from_array(&f.env, &[2u8; 32]);
+
+        f.client
+            .lock(&f.id, &f.seller, &f.buyer, &500, &f.secret_hash, &100);
+        f.client
+            .lock(&id2, &seller2, &f.buyer, &300, &secret_hash2, &100);
+
+        let releases = vec![
+            &f.env,
+            BatchReleaseItem {
+                id: f.id.clone(),
+                secret: f.secret.clone(),
+            },
+            BatchReleaseItem {
+                id: id2.clone(),
+                secret: secret2,
+            },
+        ];
+        let released = f.client.batch_release(&releases);
+
+        assert_eq!(released.len(), 2);
+        assert_eq!(f.token.balance(&f.seller), 495); // 500 - 1%
+        assert_eq!(f.token.balance(&seller2), 297); // 300 - 1%
+        assert_eq!(f.token.balance(&f.admin), 8); // 5 + 3
+
+        assert_eq!(
+            f.client.get_trade(&f.id).unwrap().status,
+            TradeStatus::Released
+        );
+        assert_eq!(
+            f.client.get_trade(&id2).unwrap().status,
+            TradeStatus::Released
+        );
+    }
+
+    #[test]
+    fn batch_release_skips_invalid_entries_without_reverting_the_batch() {
+        let f = setup(2_000, 100);
+        let seller2 = Address::generate(&f.env);
+        let secret2 = BytesN::from_array(&f.env, &[8u8; 32]);
+        let secret_hash2 = f.env.crypto().sha256(&secret2.clone().into()).to_bytes();
+        let id2 = BytesN::from_array(&f.env, &[2u8; 32]);
+        let wrong_secret = BytesN::from_array(&f.env, &[9u8; 32]);
+
+        f.client
+            .lock(&f.id, &f.seller, &f.buyer, &500, &f.secret_hash, &100);
+        f.client
+            .lock(&id2, &seller2, &f.buyer, &300, &secret_hash2, &100);
+
+        let releases = vec![
+            &f.env,
+            BatchReleaseItem {
+                id: f.id.clone(),
+                secret: f.secret.clone(),
+            },
+            BatchReleaseItem {
+                id: id2.clone(),
+                secret: wrong_secret,
+            },
+        ];
+        let released = f.client.batch_release(&releases);
+
+        // Only the entry with the correct secret gets released.
+        assert_eq!(released.len(), 1);
+        assert_eq!(released.get(0).unwrap(), f.id.clone());
+        assert_eq!(f.token.balance(&f.seller), 495);
+        assert_eq!(f.token.balance(&seller2), 0);
+        assert_eq!(
+            f.client.get_trade(&f.id).unwrap().status,
+            TradeStatus::Released
+        );
+        // The bad entry's trade is untouched — still Locked, funds still escrowed.
+        assert_eq!(
+            f.client.get_trade(&id2).unwrap().status,
+            TradeStatus::Locked
+        );
+    }
+
+    #[test]
+    fn batch_release_skips_unknown_and_already_released_ids() {
+        let f = setup(1_000, 100);
+        f.client
+            .lock(&f.id, &f.seller, &f.buyer, &500, &f.secret_hash, &100);
+        f.client.release(&f.id, &f.secret);
+
+        let unknown_id = BytesN::from_array(&f.env, &[99u8; 32]);
+        let releases = vec![
+            &f.env,
+            BatchReleaseItem {
+                id: f.id.clone(),
+                secret: f.secret.clone(),
+            }, // already released
+            BatchReleaseItem {
+                id: unknown_id,
+                secret: f.secret.clone(),
+            }, // never locked
+        ];
+        let released = f.client.batch_release(&releases);
+        assert_eq!(released.len(), 0);
+    }
+
+    #[test]
+    fn batch_release_rejects_a_batch_larger_than_the_cap() {
+        let f = setup(1_000, 100);
+        let mut releases: Vec<BatchReleaseItem> = Vec::new(&f.env);
+        for i in 0..(MAX_BATCH_SIZE + 1) {
+            let id = BytesN::from_array(&f.env, &[i as u8; 32]);
+            releases.push_back(BatchReleaseItem {
+                id,
+                secret: f.secret.clone(),
+            });
+        }
+        assert!(f.client.try_batch_release(&releases).is_err());
     }
 }

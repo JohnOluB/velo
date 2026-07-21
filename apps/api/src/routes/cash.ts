@@ -15,7 +15,7 @@ import {
 import { sendRefundAlert } from "../lib/webhook.js";
 import { notifyTradeStatus } from "./chat.js";
 import { randomHex32 } from "../lib/crypto.js";
-import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders, countProvidersByNetwork, getProviderByAddress } from "../lib/store.js";
+import { saveCashRequest, getCashRequest, updateStatus, saveProvider, getProviders, countProvidersByNetwork, getProviderByAddress, enqueueForBatch } from "../lib/store.js";
 import { parseBody } from "../lib/validation.js";
 import { sendNotification } from "../lib/notification.js";
 import { toPublicProvider, withinRadius, applyKAnonymity, DEFAULT_PRECISION } from "../utils/privacy.js";
@@ -572,6 +572,9 @@ export async function cashRoutes(app: FastifyInstance) {
       if (record.status === "released") {
         return { id: record.id, status: "released" };
       }
+      if (record.status === "pending_batch") {
+        return { id: record.id, status: "pending_batch" };
+      }
       if (record.status !== "locked") {
         reply.code(409).send({ error: `request is already ${record.status}` });
         return;
@@ -602,6 +605,16 @@ export async function cashRoutes(app: FastifyInstance) {
           return;
         }
       } else if (secret) {
+        // Providers who opted into batched payouts (POST /provider/payout-settings)
+        // don't get an immediate on-chain release() here — the secret is queued
+        // and settled later alongside their other pending trades in one
+        // batch_release() call. See docs/provider-payout-batching.md.
+        const provider = getProviderByAddress(record.seller);
+        if (provider?.payoutMode === "batched") {
+          enqueueForBatch(record.id, secret);
+          return { id: record.id, status: "pending_batch" };
+        }
+
         try {
           await releaseEscrow({
             contractId: record.contractId,

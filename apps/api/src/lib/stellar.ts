@@ -448,6 +448,50 @@ export async function disputeEscrow(params: DisputeParams) {
     );
 }
 
+export interface BatchReleaseParams {
+    contractId: string;
+    /** Each entry mirrors ReleaseParams — one trade id and its revealed secret. */
+    releases: { tradeId: string; secretHex: string }[];
+}
+
+/** Encodes one (id, secret) pair as the BatchReleaseItem struct the escrow
+ * contract expects — an ScMap with keys in alphabetical field order. */
+function batchReleaseItemScVal(tradeId: string, secretHex: string): xdr.ScVal {
+    return xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("id"),
+            val: hexToBytesScVal(tradeId),
+        }),
+        new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("secret"),
+            val: hexToBytesScVal(secretHex),
+        }),
+    ]);
+}
+
+/**
+ * Testnet-only: custodial batch release (API signs). Settles many trades'
+ * payouts in a single Soroban invocation of the escrow contract's
+ * `batch_release()` — the on-chain half of provider payout batching. Each
+ * item is still verified against its own trade's secret hash on-chain, so
+ * this changes nothing about the trust model versus calling `release()`
+ * once per trade — it only reduces how many separate transactions get
+ * submitted. See docs/provider-payout-batching.md.
+ *
+ * Returns the hex trade ids that were actually released (a stale or
+ * already-settled entry is skipped by the contract, not rejected as a
+ * whole batch).
+ */
+export async function batchReleaseEscrow(params: BatchReleaseParams): Promise<string[]> {
+    const signer = loadSignerKeypair();
+    const itemsScVal = xdr.ScVal.scvVec(
+        params.releases.map((r) => batchReleaseItemScVal(r.tradeId, r.secretHex))
+    );
+    const result = await invokeContract(params.contractId, "batch_release", [itemsScVal], signer);
+    const releasedIds = (result as Buffer[] | undefined) ?? [];
+    return releasedIds.map((id) => Buffer.from(id).toString("hex"));
+}
+
 export interface ResolveParams {
     contractId: string;
     tradeId: string;
