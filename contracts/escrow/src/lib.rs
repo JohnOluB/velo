@@ -192,9 +192,7 @@ impl EscrowContract {
             return Err(Error::InvalidSigners);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Signers, &signers);
+        env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -214,9 +212,7 @@ impl EscrowContract {
             return Err(Error::InvalidSigners);
         }
         require_multisig(&env, &auth_signers)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::Signers, &signers);
+        env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -229,11 +225,7 @@ impl EscrowContract {
     /// In single-admin mode the `signers` parameter is ignored; in
     /// multisig mode it must contain at least `threshold` authorised
     /// signers whose signatures are on the transaction.
-    pub fn set_platform_fee(
-        env: Env,
-        fee_bps: u32,
-        signers: Vec<Address>,
-    ) -> Result<(), Error> {
+    pub fn set_platform_fee(env: Env, fee_bps: u32, signers: Vec<Address>) -> Result<(), Error> {
         require_multisig(&env, &signers)?;
         env.storage()
             .instance()
@@ -394,7 +386,11 @@ impl Htlc for EscrowContract {
 }
 
 fn check_not_paused(env: &Env) {
-    if let Some(paused) = env.storage().instance().get::<DataKey, bool>(&DataKey::Paused) {
+    if let Some(paused) = env
+        .storage()
+        .instance()
+        .get::<DataKey, bool>(&DataKey::Paused)
+    {
         if paused {
             panic_with_error(env, Error::ContractPaused);
         }
@@ -407,18 +403,10 @@ fn require_multisig(env: &Env, provided_signers: &Vec<Address>) -> Result<(), Er
         .instance()
         .get::<DataKey, u32>(&DataKey::Threshold)
     {
-        let authorized: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Signers)
-            .unwrap();
+        let authorized: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
         validate_signers(env, provided_signers, &authorized, threshold)?;
     } else {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
     }
     Ok(())
@@ -751,8 +739,14 @@ mod test {
         // Dispute resolution moves escrowed funds, so it must not remain a
         // single-key action after migration.
         let m = setup_multisig();
-        m.f.client
-            .lock(&m.f.id, &m.f.seller, &m.f.buyer, &500, &m.f.secret_hash, &100);
+        m.f.client.lock(
+            &m.f.id,
+            &m.f.seller,
+            &m.f.buyer,
+            &500,
+            &m.f.secret_hash,
+            &100,
+        );
         m.f.client.dispute(&m.f.buyer, &m.f.id);
 
         let single = vec![&m.f.env, m.s1.clone()];
